@@ -1,25 +1,144 @@
 # backend/main.py
 import os
+import sys
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import timedelta
-from typing import Any, Dict, List
+from datetime import timedelta, timezone
+from typing import Any, Dict, List, Optional
 import uvicorn
 import logging
 from shapely.geometry import MultiPoint, mapping
+from zoneinfo import ZoneInfo
 
-from models import AnalyzeRequest
+from models import AnalyzeRequest, AnalyzeDbRequest, ParserStartRequest
 from utils import parse_time, point_in_analysis_geometry
 from services import (
     calculate_statistics,
     region_growing_clusters,
     aggregate_plot_data,
-    snap_features_by_engine,
+    snap_features_to_road_graph,
+    default_roads_graph_path,
+    compute_flow_directions,
 )
+from parser_control import parser_manager
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover
+    load_dotenv = None
+
+try:
+    import psycopg
+except Exception:  # pragma: no cover
+    psycopg = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+if load_dotenv is not None:
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"), override=False)
+
+
+def _congestion_index_from_avg(avg_speed: float) -> int:
+    if avg_speed > 0:
+        return min(10, max(1, round(11 - (avg_speed / 40) * 10)))
+    return 10
+
+
+def _build_zones_for_direction(
+    slow_candidates: List[List[float]],
+    slow_indices: List[int],
+    speeds: List[float],
+    dirs: List[Optional[int]],
+    dir_id: int,
+    eps_m: float,
+    min_pts: int,
+    return_all: bool,
+) -> List[Dict[str, Any]]:
+    filtered_coords: List[List[float]] = []
+    filtered_speeds: List[float] = []
+    for k, idx in enumerate(slow_indices):
+        if dirs[idx] == dir_id:
+            filtered_coords.append(slow_candidates[k])
+            filtered_speeds.append(speeds[idx])
+    if not filtered_coords:
+        return []
+    clusters = region_growing_clusters(filtered_coords, eps_m, min_pts)
+    iterable = clusters if return_all else clusters[:1]
+    zones: List[Dict[str, Any]] = []
+    for cluster_idx, cluster in enumerate(iterable):
+        cluster_coords = [filtered_coords[i] for i in cluster]
+        mp = MultiPoint(cluster_coords)
+        if mp.is_empty:
+            continue
+        hull = mp.convex_hull
+        hull_gj = mapping(hull)
+        avg_sp = sum(filtered_speeds[i] for i in cluster) / len(cluster)
+        hull_gj["properties"] = {
+            "cluster_size": len(cluster),
+            "cluster_index": cluster_idx,
+            "avg_speed": avg_sp,
+            "direction_id": dir_id,
+        }
+        zones.append(hull_gj)
+    return zones
+
+
+def _direction_payload(
+    dir_id: int,
+    ref_bearing: float,
+    speeds: List[float],
+    dirs: List[Optional[int]],
+    raw_times: List[str],
+    req: AnalyzeRequest,
+    slow_candidates: List[List[float]],
+    slow_indices: List[int],
+) -> Dict[str, Any]:
+    indices = [i for i, d in enumerate(dirs) if d == dir_id]
+    if not indices:
+        label_angle = (ref_bearing + (180 if dir_id == 1 else 0)) % 360
+        return {
+            "id": dir_id,
+            "label": f"~{label_angle:.0f}°",
+            "avg_speed": None,
+            "congestion_index": 1,
+            "count": 0,
+            "statistics": {},
+            "plot": {"times": [], "speeds": [], "raw_times": [], "raw_speeds": []},
+            "congestion_zones": [],
+        }
+    sp = [speeds[i] for i in indices]
+    tms = [raw_times[i] for i in indices]
+    avg = sum(sp) / len(sp)
+    ci = _congestion_index_from_avg(avg)
+    agg_times, agg_speeds = aggregate_plot_data(tms, sp, interval_minutes=15)
+    stats = calculate_statistics(sp)
+    zones = _build_zones_for_direction(
+        slow_candidates,
+        slow_indices,
+        speeds,
+        dirs,
+        dir_id,
+        req.eps_m,
+        req.min_pts,
+        req.return_all_clusters,
+    )
+    label_angle = (ref_bearing + (180 if dir_id == 1 else 0)) % 360
+    return {
+        "id": dir_id,
+        "label": f"~{label_angle:.0f}°",
+        "avg_speed": avg,
+        "congestion_index": ci,
+        "count": len(indices),
+        "statistics": stats,
+        "plot": {
+            "times": agg_times,
+            "speeds": agg_speeds,
+            "raw_times": tms,
+            "raw_speeds": sp,
+        },
+        "congestion_zones": zones,
+    }
+
 
 app = FastAPI(
     title="Transport Analysis API",
@@ -48,6 +167,125 @@ async def root():
 async def health():
     return {"status": "healthy"}
 
+
+@app.get("/parser/status")
+async def parser_status():
+    return parser_manager.status()
+
+
+@app.post("/parser/start")
+async def parser_start(req: ParserStartRequest):
+    status = parser_manager.start(use_db=req.use_db, cookie=req.cookie)
+    return status
+
+
+@app.post("/parser/stop")
+async def parser_stop():
+    status = parser_manager.stop()
+    return status
+
+
+@app.get("/parser/logs")
+async def parser_logs(lines: int = 200):
+    try:
+        return parser_manager.read_logs(lines=lines)
+    except Exception as exc:
+        logger.error("Error reading parser logs: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _build_geojson_from_db(req: AnalyzeDbRequest) -> Dict[str, Any]:
+    if psycopg is None:
+        raise RuntimeError(
+            "psycopg is not installed in backend interpreter: "
+            f"{sys.executable}. Install with: \"{sys.executable}\" -m pip install psycopg[binary]"
+        )
+
+    dsn = os.getenv("IRKBUS_DB_DSN")
+    if not dsn:
+        raise RuntimeError("IRKBUS_DB_DSN is not configured.")
+
+    start_dt = parse_time(req.start) if req.start else None
+    end_dt = parse_time(req.end) if req.end else None
+    if start_dt and end_dt and start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="Start time must be before end time")
+
+    # Client time for DB mode is local Irkutsk time; convert to UTC for DB query.
+    irkutsk_tz = ZoneInfo("Asia/Irkutsk")
+    db_start = _to_utc_for_db(start_dt, irkutsk_tz) if start_dt else None
+    db_end = _to_utc_for_db(end_dt, irkutsk_tz) if end_dt else None
+
+    where = ["event_time IS NOT NULL", "geom IS NOT NULL"]
+    params: List[Any] = []
+    if db_start:
+        where.append("event_time >= %s")
+        params.append(db_start)
+    if db_end:
+        where.append("event_time <= %s")
+        params.append(db_end)
+    if req.routes:
+        where.append("route_num = ANY(%s)")
+        params.append(req.routes)
+
+    sql = f"""
+        SELECT
+            ST_X(geom) AS lon,
+            ST_Y(geom) AS lat,
+            vehicle_id,
+            rid,
+            route_num,
+            route_type,
+            speed_kmh,
+            dir_deg,
+            low_floor,
+            wifi,
+            gos_num,
+            event_time
+        FROM transport.telemetry_snapshot
+        WHERE {' AND '.join(where)}
+        ORDER BY event_time ASC
+        LIMIT %s
+    """
+    params.append(req.max_points)
+
+    features: List[Dict[str, Any]] = []
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    for row in rows:
+        lon, lat = float(row[0]), float(row[1])
+        event_time = row[11]
+        # Emit naive UTC text so existing /analyze (+8h) behaves like file mode.
+        if hasattr(event_time, "astimezone"):
+            naive_utc = event_time.astimezone(timezone.utc).replace(tzinfo=None)
+            time_text = naive_utc.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            time_text = str(event_time)
+
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": {
+                    "id": row[2],
+                    "route_id": row[3],
+                    "route_num": row[4],
+                    "rtype": row[5],
+                    "speed": row[6],
+                    "dir": row[7],
+                    "low_floor": "1" if row[8] else "0" if row[8] is not None else None,
+                    "wifi": "1" if row[9] else "0" if row[9] is not None else None,
+                    "gos_num": row[10],
+                    "time": time_text,
+                },
+            }
+        )
+
+    return {"type": "FeatureCollection", "features": features}
+
+
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
     try:
@@ -62,6 +300,12 @@ async def analyze(req: AnalyzeRequest):
         
         if start_dt and end_dt and start_dt > end_dt:
             raise HTTPException(status_code=400, detail="Start time must be before end time")
+
+        if req.bidirectional_analysis and not req.analysis_geometry:
+            raise HTTPException(
+                status_code=400,
+                detail="Двунаправленный анализ доступен только при выбранной области на карте (полигон).",
+            )
 
         fmt_errors = 0
         filtered_points = []
@@ -131,10 +375,8 @@ async def analyze(req: AnalyzeRequest):
                 slow_indices.append(idx)
 
         if req.map_matching and filtered_points:
-            filtered_points = snap_features_by_engine(
+            filtered_points = snap_features_to_road_graph(
                 filtered_points,
-                engine=req.snap_engine,
-                roads_path=req.roads_geojson_path,
                 tolerance_m=req.snap_tolerance_m,
             )
             # Rebuild slow candidates with potentially new coordinates
@@ -144,6 +386,21 @@ async def analyze(req: AnalyzeRequest):
                 coords = feat.get("geometry", {}).get("coordinates")
                 if coords:
                     slow_candidates.append(coords)
+
+        dirs: Optional[List[Optional[int]]] = None
+        point_bearings: Optional[List[Optional[float]]] = None
+        ref_bearing = 0.0
+        if req.bidirectional_analysis and filtered_points:
+            dirs, point_bearings, ref_bearing = compute_flow_directions(
+                filtered_points,
+                min_segment_m=8.0,
+            )
+            for i, feat in enumerate(filtered_points):
+                props = feat.setdefault("properties", {})
+                if point_bearings is not None and point_bearings[i] is not None:
+                    props["flow_bearing"] = round(point_bearings[i], 2)
+                if dirs is not None and dirs[i] is not None:
+                    props["flow_dir"] = dirs[i]
 
         # Calculate Congestion Index (1-10)
         # Assuming 40 km/h is free flow speed.
@@ -169,14 +426,13 @@ async def analyze(req: AnalyzeRequest):
         if fmt_errors:
             result["warnings"].append(f"Could not parse {fmt_errors} time values")
 
-        if req.map_matching and req.snap_engine == "qgis":
-            rpath = (req.roads_geojson_path or os.environ.get("ROADS_GEOJSON_PATH") or "").strip()
-            rpath = os.path.expanduser(rpath)
-            if not rpath or not os.path.isfile(rpath):
+        if req.map_matching:
+            graph_path = default_roads_graph_path()
+            if not os.path.isfile(graph_path):
                 result["warnings"].append(
-                    "Привязка к графу: не задан или не найден файл дорог (roads_geojson_path или ROADS_GEOJSON_PATH)."
+                    f"Привязка к графу: файл highway_graph.geojson не найден в корне проекта ({graph_path})."
                 )
-        
+
         if not filtered_points:
             result["warnings"].append("No points matching criteria")
             return result
@@ -210,6 +466,22 @@ async def analyze(req: AnalyzeRequest):
             if result["congestion_zones"]:
                 result["congestion"] = result["congestion_zones"][0]
 
+        if req.bidirectional_analysis and filtered_points and dirs is not None:
+            ucount = sum(1 for d in dirs if d is None)
+            result["bidirectional"] = {
+                "reference_bearing_deg": ref_bearing,
+                "unclassified_count": ucount,
+                "directions": [
+                    _direction_payload(0, ref_bearing, speeds, dirs, raw_times, req, slow_candidates, slow_indices),
+                    _direction_payload(1, ref_bearing, speeds, dirs, raw_times, req, slow_candidates, slow_indices),
+                ],
+            }
+            if ucount == len(dirs):
+                result["warnings"].append(
+                    "Двунаправленный анализ: не удалось классифицировать точки по направлению "
+                    "(нужны цепочки точек с перемещением между соседними по времени > 8 м).",
+                )
+
         return result
 
     except HTTPException:
@@ -217,6 +489,113 @@ async def analyze(req: AnalyzeRequest):
     except Exception as e:
         logger.error(f"Error in analyze: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze/db")
+async def analyze_db(req: AnalyzeDbRequest):
+    try:
+        geojson = _build_geojson_from_db(req)
+        bridge_req = AnalyzeRequest(
+            geojson=geojson,
+            # SQL query already applies time filtering in local (Irkutsk) semantics.
+            # Avoid re-filtering in /analyze where +8h offset is applied for file mode.
+            start=None,
+            end=None,
+            include_zero=req.include_zero,
+            speed_thresh=req.speed_thresh,
+            eps_m=req.eps_m,
+            min_pts=req.min_pts,
+            return_all_clusters=req.return_all_clusters,
+            routes=req.routes,
+            map_matching=req.map_matching,
+            snap_tolerance_m=req.snap_tolerance_m,
+            analysis_geometry=req.analysis_geometry,
+            bidirectional_analysis=req.bidirectional_analysis,
+        )
+        result = await analyze(bridge_req)
+        if len(geojson.get("features", [])) >= req.max_points:
+            result.setdefault("warnings", []).append(
+                f"Достигнут лимит выборки из БД: {req.max_points} точек. Уточните период/фильтры."
+            )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in analyze_db: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analyze/db/meta")
+async def analyze_db_meta():
+    try:
+        if psycopg is None:
+            raise RuntimeError(
+                "psycopg is not installed in backend interpreter: "
+                f"{sys.executable}. Install with: \"{sys.executable}\" -m pip install psycopg[binary]"
+            )
+
+        dsn = os.getenv("IRKBUS_DB_DSN")
+        if not dsn:
+            raise RuntimeError("IRKBUS_DB_DSN is not configured.")
+
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        MIN(event_time) AS min_time,
+                        MAX(event_time) AS max_time,
+                        COUNT(*) AS points_count
+                    FROM transport.telemetry_snapshot
+                    WHERE event_time IS NOT NULL;
+                    """
+                )
+                row = cur.fetchone()
+                min_time = row[0] if row else None
+                max_time = row[1] if row else None
+                points_count = int(row[2] or 0) if row else 0
+
+                cur.execute(
+                    """
+                    SELECT DISTINCT route_num
+                    FROM transport.telemetry_snapshot
+                    WHERE route_num IS NOT NULL AND route_num <> ''
+                    ORDER BY route_num;
+                    """
+                )
+                routes = [str(r[0]) for r in cur.fetchall()]
+
+        irkutsk_tz = ZoneInfo("Asia/Irkutsk")
+        min_local = _format_local_naive(min_time, irkutsk_tz)
+        max_local = _format_local_naive(max_time, irkutsk_tz)
+
+        return {
+            # Send local-naive datetimes to avoid timezone shifts in browser auto-fill.
+            "min_time": min_local,
+            "max_time": max_local,
+            "points_count": points_count,
+            "routes": routes,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in analyze_db_meta: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _to_utc_for_db(dt: Any, local_tz: ZoneInfo):
+    if getattr(dt, "tzinfo", None) is None:
+        aware_local = dt.replace(tzinfo=local_tz)
+    else:
+        aware_local = dt.astimezone(local_tz)
+    return aware_local.astimezone(timezone.utc)
+
+
+def _format_local_naive(dt: Any, local_tz: ZoneInfo) -> Optional[str]:
+    if dt is None:
+        return None
+    local_dt = dt.astimezone(local_tz)
+    return local_dt.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
