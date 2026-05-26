@@ -10,11 +10,16 @@ const props = defineProps(['data', 'height'])
 const mapContainer = ref(null)
 const heatmapMode = ref(false)
 const analysisAreaGeometry = inject('analysisAreaGeometry')
+const isochroneOrigin = inject('isochroneOrigin', null)
+const isochroneResult = inject('isochroneResult', null)
+const isochronePickMode = inject('isochronePickMode', null)
 
 let map = null
 let routeLayer = null
 let congestionLayer = null
 let heatLayer = null
+let isochroneLayer = null
+let originMarker = null
 let drawnItems = null
 let canvasRenderer = null
 const HEAVY_FEATURES_THRESHOLD = 1500
@@ -78,6 +83,15 @@ onMounted(() => {
     if (analysisAreaGeometry) analysisAreaGeometry.value = null
   })
 
+  map.on('click', (e) => {
+    if (isochronePickMode?.value) {
+      if (isochroneOrigin) {
+        isochroneOrigin.value = [e.latlng.lng, e.latlng.lat]
+      }
+      drawIsochroneLayers()
+    }
+  })
+
   // Wait for parent layout to stabilize
   setTimeout(() => {
     map.invalidateSize()
@@ -126,6 +140,58 @@ const createBusDirectionIcon = (fillColor, dir) => {
   })
 }
 
+const drawIsochroneLayers = () => {
+  if (!map) return
+  if (isochroneLayer) {
+    map.removeLayer(isochroneLayer)
+    isochroneLayer = null
+  }
+  if (originMarker) {
+    map.removeLayer(originMarker)
+    originMarker = null
+  }
+
+  const fc = isochroneResult?.value?.geojson
+  if (fc?.features?.length) {
+    isochroneLayer = L.geoJSON(fc, {
+      filter: (f) => f.properties?.role !== 'origin' && f.properties?.role !== 'snapped_node',
+      style: (f) => {
+        const c = f.properties?.fill_color || '#3b82f6'
+        return {
+          color: c,
+          weight: 2,
+          fillColor: c,
+          fillOpacity: 0.28,
+        }
+      },
+      onEachFeature: (feature, layer) => {
+        const p = feature.properties || {}
+        if (p.interval_min != null) {
+          layer.bindPopup(`<b>≤ ${p.interval_min} мин</b><br/>Узлов: ${p.reachable_nodes || '—'}`)
+        }
+      },
+    }).addTo(map)
+
+    const bounds = isochroneLayer.getBounds()
+    if (bounds.isValid()) {
+      map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 })
+    }
+  }
+
+  const origin = isochroneOrigin?.value
+  if (origin?.length === 2) {
+    originMarker = L.circleMarker([origin[1], origin[0]], {
+      radius: 8,
+      color: '#1d4ed8',
+      weight: 3,
+      fillColor: '#2563eb',
+      fillOpacity: 0.9,
+    })
+      .addTo(map)
+      .bindPopup('Точка объекта')
+  }
+}
+
 watch(() => props.data, (newData) => {
   if (!newData) {
     if (routeLayer) map.removeLayer(routeLayer)
@@ -136,6 +202,19 @@ watch(() => props.data, (newData) => {
 
   drawMap()
 })
+
+watch(
+  () => isochroneResult?.value,
+  () => drawIsochroneLayers(),
+  { deep: true },
+)
+
+watch(
+  () => isochroneOrigin?.value,
+  () => {
+    if (!isochroneResult?.value) drawIsochroneLayers()
+  },
+)
 
 watch(heatmapMode, () => {
   drawMap()
@@ -312,8 +391,18 @@ watch(
   <div class="w-full h-full relative z-10">
     <div ref="mapContainer" class="w-full h-full"></div>
     
-    <div class="absolute top-4 left-14 z-[1000] max-w-[220px] pointer-events-none">
-      <div class="pointer-events-auto bg-white/95 backdrop-blur-sm border border-gray-200 rounded-xl shadow-lg px-3 py-2 text-[11px] text-gray-600 leading-snug">
+    <div class="absolute top-4 left-14 z-[1000] max-w-[240px] pointer-events-none">
+      <div
+        v-if="isochronePickMode?.value"
+        class="pointer-events-auto bg-primary-50 border border-primary-200 rounded-xl shadow-lg px-3 py-2 text-[11px] text-primary-900 leading-snug"
+      >
+        <span class="font-semibold">Доступность:</span>
+        клик по карте — точка объекта. Затем «Построить зоны» в панели слева.
+      </div>
+      <div
+        v-else-if="props.data"
+        class="pointer-events-auto bg-white/95 backdrop-blur-sm border border-gray-200 rounded-xl shadow-lg px-3 py-2 text-[11px] text-gray-600 leading-snug"
+      >
         <span class="font-semibold text-gray-800">Область анализа:</span>
         панель слева — нарисуйте полигон. Редактирование и удаление — там же.
       </div>

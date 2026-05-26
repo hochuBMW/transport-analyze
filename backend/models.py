@@ -101,3 +101,43 @@ class AnalyzeDbRequest(BaseModel):
         if not isinstance(v, dict) or v.get("type") not in ("Polygon", "MultiPolygon"):
             raise ValueError("analysis_geometry must be a GeoJSON Polygon or MultiPolygon object")
         return v
+
+
+class PedestrianIsochroneRequest(BaseModel):
+    """Запрос пеших изохрон (этап 2). origin — [longitude, latitude] WGS84."""
+
+    origin: List[float] = Field(..., min_length=2, max_length=2, description="[lon, lat]")
+    interval_step_min: float = Field(5.0, gt=0, le=120, description="Шаг интервала, минуты")
+    interval_count: int = Field(3, ge=1, le=10, description="Число зон (5, 10, 15 при шаге 5)")
+    max_snap_m: float = Field(80.0, gt=0, le=500, description="Допуск привязки точки к графу, м")
+    intervals_min: Optional[List[float]] = Field(
+        None,
+        description="Явный список порогов в минутах; если задан — interval_step/count игнорируются",
+    )
+
+    @validator("origin")
+    def validate_origin(cls, v):
+        lon, lat = float(v[0]), float(v[1])
+        if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+            raise ValueError("origin must be valid WGS84 coordinates [lon, lat]")
+        return [lon, lat]
+
+
+class PedestrianIsochroneRequest(BaseModel):
+    """Запрос пеших изохрон (этап 2). origin — [longitude, latitude] WGS84."""
+
+    origin: List[float] = Field(..., min_length=2, max_length=2, description="[lon, lat]")
+    interval_step_min: float = Field(5.0, gt=0, le=120, description="Шаг интервала, минуты")
+    interval_count: int = Field(3, ge=1, le=10, description="Число зон (5, 10, 15 при шаге 5)")
+    max_snap_m: float = Field(80.0, gt=0, le=500, description="Допуск привязки точки к графу, м")
+    intervals_min: Optional[List[float]] = Field(
+        None,
+        description="Явный список порогов в минутах; если задан — interval_step/count игнорируются",
+    )
+
+    @validator("origin")
+    def validate_origin(cls, v):
+        lon, lat = float(v[0]), float(v[1])
+        if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+            raise ValueError("origin must be valid WGS84 coordinates [lon, lat]")
+        return [lon, lat]

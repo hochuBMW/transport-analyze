@@ -62,6 +62,10 @@ def run_once(client: IrkBusClient, config: IrkBusConfig, pg_writer: Optional[Pos
     fetched_at = datetime.now(timezone.utc)
     fetched_at_iso = fetched_at.isoformat()
 
+    periodic_status = client.maybe_refresh_periodic()
+    if periodic_status == "refreshed":
+        logger.info("Proactive session refresh before snapshot.")
+
     payload = client.fetch_snapshot()
     features = normalize_snapshot(payload=payload, fetched_at_iso=fetched_at_iso, source_tz=config.timezone_name)
     paths = persist_files(
@@ -88,8 +92,6 @@ def run_once(client: IrkBusClient, config: IrkBusConfig, pg_writer: Optional[Pos
     refresh_status = client.maybe_refresh_after_empty()
     if refresh_status == "refreshed":
         logger.warning("Session refreshed after repeated empty snapshots.")
-    elif refresh_status == "seed_cookie_stale":
-        logger.warning("Waiting for manual cookie update from UI (seed-cookie mode).")
 
 
 def main() -> None:
@@ -102,7 +104,17 @@ def main() -> None:
     client = IrkBusClient(config)
     pg_writer = open_postgres_writer(config, disable_db=args.no_db)
 
-    logger.info("Collector started with interval=%ss routes=%s", config.poll_interval_sec, config.routes)
+    refresh_note = (
+        f"session_refresh={int(config.session_refresh_sec)}s"
+        if config.session_refresh_sec > 0
+        else "session_refresh=disabled"
+    )
+    logger.info(
+        "Collector started with interval=%ss routes=%s %s",
+        config.poll_interval_sec,
+        config.routes,
+        refresh_note,
+    )
 
     try:
         client.ensure_session()

@@ -28,7 +28,7 @@ class IrkBusClient:
         )
         self.empty_streak = 0
         self.seed_cookie_mode = False
-        self._warned_seed_stale = False
+        self._last_session_refresh_monotonic = time.monotonic()
         if config.cookie_header:
             self._apply_cookie_header(config.cookie_header)
         if self.session.cookies.get("PHPSESSID"):
@@ -64,6 +64,8 @@ class IrkBusClient:
         return f"{self.config.base_url}{self.config.endpoint}"
 
     def refresh_session(self) -> None:
+        # Mimic a browser page reload: keep PHPSESSID, re-open the site so the
+        # server re-initializes session state (routes/city/map context).
         landing_url = f"{self.config.base_url}/"
         response = self.session.get(
             landing_url,
@@ -71,11 +73,12 @@ class IrkBusClient:
             allow_redirects=True,
         )
         response.raise_for_status()
+        self._last_session_refresh_monotonic = time.monotonic()
         session_id = self.session.cookies.get("PHPSESSID")
         if session_id:
-            logger.info("Session refreshed: PHPSESSID=%s...", session_id[:8])
+            logger.info("Session wake-up: PHPSESSID=%s... (unchanged cookie is OK)", session_id[:8])
         else:
-            logger.warning("Session refresh completed but PHPSESSID not found.")
+            logger.warning("Session wake-up completed but PHPSESSID not found.")
 
     def fetch_snapshot(self) -> Dict[str, Any]:
         params = {
@@ -108,41 +111,41 @@ class IrkBusClient:
     def should_refresh_after_empty(self) -> bool:
         return self.empty_streak >= self.config.empty_streak_refresh
 
+    def should_refresh_periodically(self) -> bool:
+        interval = self.config.session_refresh_sec
+        if interval <= 0:
+            return False
+        elapsed = time.monotonic() - self._last_session_refresh_monotonic
+        return elapsed >= interval
+
     def ensure_session(self) -> None:
         if not self.session.cookies.get("PHPSESSID"):
             self.refresh_session()
 
-    def recover_after_error(self, exc: Exception) -> None:
-        logger.warning("Collector request failed: %s", exc)
-        if self.seed_cookie_mode:
-            logger.warning(
-                "Seed-cookie mode: skip auto session refresh after error. "
-                "If persistent failures continue, restart parser with fresh cookie from DevTools."
-            )
-            return
+    def _try_refresh_session(self, reason: str) -> Optional[str]:
         try:
             self.refresh_session()
             self.empty_streak = 0
-        except Exception as refresh_exc:
-            logger.error("Session refresh after error failed: %s", refresh_exc)
+            logger.info("Session refreshed (%s).", reason)
+            return "refreshed"
+        except Exception as exc:
+            logger.error("Session refresh failed (%s): %s", reason, exc)
+            return "failed"
+
+    def maybe_refresh_periodic(self) -> Optional[str]:
+        if not self.should_refresh_periodically():
+            return None
+        return self._try_refresh_session(
+            f"scheduled every {int(self.config.session_refresh_sec)}s"
+        )
+
+    def recover_after_error(self, exc: Exception) -> None:
+        logger.warning("Collector request failed: %s", exc)
+        self._try_refresh_session("after request error")
 
     def maybe_refresh_after_empty(self) -> Optional[str]:
         if not self.should_refresh_after_empty():
             return None
-        if self.seed_cookie_mode:
-            if not self._warned_seed_stale:
-                logger.warning(
-                    "Seed-cookie mode: reached %s empty snapshots. "
-                    "Cookie likely stale; paste fresh cookie in UI and press Start to restart parser.",
-                    self.config.empty_streak_refresh,
-                )
-                self._warned_seed_stale = True
-            return "seed_cookie_stale"
-        try:
-            self.refresh_session()
-            self.empty_streak = 0
-            self._warned_seed_stale = False
-            return "refreshed"
-        except Exception as exc:
-            logger.error("Session refresh after empty streak failed: %s", exc)
-            return "failed"
+        return self._try_refresh_session(
+            f"after {self.empty_streak} empty snapshots"
+        )

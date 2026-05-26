@@ -11,7 +11,8 @@ import logging
 from shapely.geometry import MultiPoint, mapping
 from zoneinfo import ZoneInfo
 
-from models import AnalyzeRequest, AnalyzeDbRequest, ParserStartRequest
+from models import AnalyzeRequest, AnalyzeDbRequest, ParserStartRequest, PedestrianIsochroneRequest
+from isochrone.pedestrian import compute_pedestrian_isochrones
 from utils import parse_time, build_analysis_geometry_checker
 from services import (
     calculate_statistics,
@@ -22,6 +23,7 @@ from services import (
     compute_flow_directions,
 )
 from parser_control import parser_manager
+from graph_store import default_geojson_path, default_pickle_path, graph_summary
 try:
     from dotenv import load_dotenv
 except Exception:  # pragma: no cover
@@ -550,6 +552,54 @@ async def analyze_db(req: AnalyzeDbRequest):
         raise
     except Exception as e:
         logger.error(f"Error in analyze_db: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/isochrone/pedestrian")
+async def isochrone_pedestrian(req: PedestrianIsochroneRequest):
+    try:
+        if req.intervals_min:
+            intervals = sorted({float(x) for x in req.intervals_min if float(x) > 0})
+        else:
+            intervals = [
+                req.interval_step_min * (i + 1) for i in range(req.interval_count)
+            ]
+        if not intervals:
+            raise HTTPException(status_code=400, detail="Не заданы положительные интервалы времени")
+        return compute_pedestrian_isochrones(
+            origin_lon=req.origin[0],
+            origin_lat=req.origin[1],
+            intervals_min=intervals,
+            max_snap_m=req.max_snap_m,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("isochrone_pedestrian: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/graph/pedestrian/status")
+async def pedestrian_graph_status():
+    """Проверка этапа 1: собран ли пеший граф из QGIS → pickle."""
+    pkl = default_pickle_path()
+    geojson = default_geojson_path()
+    if not os.path.isfile(pkl):
+        return {
+            "ready": False,
+            "pickle_path": pkl,
+            "geojson_path": geojson,
+            "geojson_exists": os.path.isfile(geojson),
+            "hint": (
+                "Экспортируйте пешую сеть в data/pedestrian_graph.geojson и выполните: "
+                "cd backend && python -m scripts.build_pedestrian_graph"
+            ),
+        }
+    try:
+        return {"ready": True, "pickle_path": pkl, **graph_summary(pkl)}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 

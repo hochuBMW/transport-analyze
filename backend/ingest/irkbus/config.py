@@ -44,6 +44,7 @@ class IrkBusConfig:
     poll_interval_sec: float
     request_timeout_sec: float
     empty_streak_refresh: int
+    session_refresh_sec: float
     data_dir: Path
     timezone_name: str
     use_database: bool
@@ -71,6 +72,7 @@ def load_config() -> IrkBusConfig:
     poll_interval_sec = _to_float(os.getenv("IRKBUS_POLL_INTERVAL_SEC"), 10.0)
     request_timeout_sec = _to_float(os.getenv("IRKBUS_TIMEOUT_SEC"), 20.0)
     empty_streak_refresh = _to_int(os.getenv("IRKBUS_EMPTY_STREAK_REFRESH"), 6)
+    session_refresh_sec = _to_float(os.getenv("IRKBUS_SESSION_REFRESH_SEC"), 5400.0)
     data_dir = Path(os.getenv("IRKBUS_DATA_DIR") or _default_data_dir())
     timezone_name = os.getenv("IRKBUS_TIMEZONE", "Asia/Irkutsk")
     postgres_dsn = os.getenv("IRKBUS_DB_DSN")
@@ -94,6 +96,7 @@ def load_config() -> IrkBusConfig:
         poll_interval_sec=max(1.0, poll_interval_sec),
         request_timeout_sec=max(3.0, request_timeout_sec),
         empty_streak_refresh=max(1, empty_streak_refresh),
+        session_refresh_sec=max(0.0, session_refresh_sec),
         data_dir=data_dir,
         timezone_name=timezone_name,
         use_database=use_database,

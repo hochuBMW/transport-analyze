@@ -4,18 +4,27 @@ import Sidebar from './components/Sidebar.vue'
 import MainMap from './components/MainMap.vue'
 import ChartSection from './components/ChartSection.vue'
 import ParserTab from './components/ParserTab.vue'
+import AccessibilityTab from './components/AccessibilityTab.vue'
 
 const isSidebarOpen = ref(true)
+const accessibilitySidebarOpen = ref(true)
 const analysisResult = shallowRef(null)
 const isLoading = ref(false)
 const activeTab = ref('analysis')
 /** GeoJSON Polygon | MultiPolygon | null — область анализа на карте (WGS84) */
 const analysisAreaGeometry = ref(null)
+/** [lon, lat] — точка для изохрон */
+const isochroneOrigin = ref(null)
+const isochroneResult = shallowRef(null)
+const isochronePickMode = ref(false)
 
 // Provide shared state/actions
 provide('analysisResult', analysisResult)
 provide('isLoading', isLoading)
 provide('analysisAreaGeometry', analysisAreaGeometry)
+provide('isochroneOrigin', isochroneOrigin)
+provide('isochroneResult', isochroneResult)
+provide('isochronePickMode', isochronePickMode)
 
 const toggleSidebar = () => {
   isSidebarOpen.value = !isSidebarOpen.value
@@ -71,6 +80,15 @@ const stopResize = () => {
         Анализ
       </button>
       <button
+        @click="setTab('accessibility')"
+        :class="[
+          'px-4 py-2 rounded-lg text-sm font-semibold transition-colors',
+          activeTab === 'accessibility' ? 'bg-primary-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200',
+        ]"
+      >
+        Доступность
+      </button>
+      <button
         @click="setTab('parser')"
         :class="[
           'px-4 py-2 rounded-lg text-sm font-semibold transition-colors',
@@ -115,6 +133,16 @@ const stopResize = () => {
         >
           <ChartSection :data="analysisResult" />
         </div>
+      </main>
+    </div>
+
+    <div v-else-if="activeTab === 'accessibility'" class="flex flex-1 overflow-hidden">
+      <AccessibilityTab
+        :isOpen="accessibilitySidebarOpen"
+        @toggle="accessibilitySidebarOpen = !accessibilitySidebarOpen"
+      />
+      <main class="flex-1 relative min-h-0 bg-gray-100">
+        <MainMap :data="null" class="w-full h-full" />
       </main>
     </div>
 
